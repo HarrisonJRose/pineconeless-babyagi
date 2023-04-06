@@ -7,10 +7,15 @@ import sys
 from collections import deque
 from typing import Dict, List
 from dotenv import load_dotenv
+import local_embeddings
 import os
 
 #Set Variables
 load_dotenv()
+
+# Name local embeddings files
+EMBEDDINGS = "embeddings.csv"
+MEMORIES = "memories.json"
 
 # Set API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -20,16 +25,6 @@ assert OPENAI_API_KEY, "OPENAI_API_KEY environment variable is missing from .env
 USE_GPT4 = False
 if USE_GPT4:
     print("\033[91m\033[1m"+"\n*****USING GPT-4. POTENTIALLY EXPENSIVE. MONITOR YOUR COSTS*****"+"\033[0m\033[0m")
-
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
-
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east1-gcp")
-assert PINECONE_ENVIRONMENT, "PINECONE_ENVIRONMENT environment variable is missing from .env"
-
-# Table config
-YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "")
-assert YOUR_TABLE_NAME, "TABLE_NAME environment variable is missing from .env"
 
 # Project config
 OBJECTIVE = sys.argv[1] if len(sys.argv) > 1 else os.getenv("OBJECTIVE", "")
@@ -44,21 +39,14 @@ print(OBJECTIVE)
 
 # Configure OpenAI and Pinecone
 openai.api_key = OPENAI_API_KEY
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
-
-# Create Pinecone index
-table_name = YOUR_TABLE_NAME
-dimension = 1536
-metric = "cosine"
-pod_type = "p1"
-if table_name not in pinecone.list_indexes():
-    pinecone.create_index(table_name, dimension=dimension, metric=metric, pod_type=pod_type)
-
-# Connect to the index
-index = pinecone.Index(table_name)
 
 # Task list
 task_list = deque([])
+
+# Create the memory database, this replaced pinecone
+memory_db = local_embeddings.MemorySystem(MEMORIES,EMBEDDINGS)
+memory_db.load_memory_system()
+
 
 def add_task(task: Dict):
     task_list.append(task)
@@ -119,21 +107,16 @@ def prioritization_agent(this_task_id:int, gpt_version: str = 'gpt-3'):
 
 def execution_agent(objective:str,task: str, gpt_version: str = 'gpt-3') -> str:
     #context = context_agent(index="quickstart", query="my_search_query", n=5)
-    context=context_agent(index=YOUR_TABLE_NAME, query=objective, n=5)
+    context=context_agent(query=objective, n=5)
     #print("\n*******RELEVANT CONTEXT******\n")
     #print(context)
     prompt =f"You are an AI who performs one task based on the following objective: {objective}.\nTake into account these previously completed tasks: {context}\nYour task: {task}\nResponse:"
     return openai_call(prompt, USE_GPT4, 0.7, 2000)
 
-def context_agent(query: str, index: str, n: int):
+def context_agent(query: str, n: int):
     query_embedding = get_ada_embedding(query)
-    index = pinecone.Index(index_name=index)
-    results = index.query(query_embedding, top_k=n,
-    include_metadata=True)
-    #print("***** RESULTS *****")
-    #print(results)
-    sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)    
-    return [(str(item.metadata['task'])) for item in sorted_results]
+    results = memory_db.query_memory(query_embedding, n)
+    return [(str(item['task'])) for item in results]
 
 # Add the first task
 first_task = {
@@ -166,7 +149,8 @@ while True:
         enriched_result = {'data': result}  # This is where you should enrich the result if needed
         result_id = f"result_{task['task_id']}"
         vector = enriched_result['data']  # extract the actual result from the dictionary
-        index.upsert([(result_id, get_ada_embedding(vector),{"task":task['task_name'],"result":result})])
+        memory_db.add_memory(task['task_name'],result,get_ada_embedding(vector))
+        memory_db.save_memory_system()
 
     # Step 3: Create new tasks and reprioritize task list
     new_tasks = task_creation_agent(OBJECTIVE,enriched_result, task["task_name"], [t["task_name"] for t in task_list])
